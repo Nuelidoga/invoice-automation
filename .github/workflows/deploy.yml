@@ -1,0 +1,106 @@
+name: Deploy Invoice Automation
+
+on:
+  pull_request:
+    paths: ["invoice-automation.json", "create_invoices_table.sql", ".github/workflows/**"]
+  push:
+    branches: [main]
+    paths: ["invoice-automation.json", "create_invoices_table.sql", ".github/workflows/**"]
+  workflow_dispatch:
+    inputs:
+      first_deploy:
+        description: "First deploy? (creates Outlook connection + SQL table). Leave false for redeploys so the Outlook authorization is NOT wiped."
+        type: boolean
+        default: false
+
+permissions:
+  id-token: write   # needed for OIDC login to Azure
+  contents: read
+
+env:
+  RESOURCE_GROUP: ${{ vars.RESOURCE_GROUP }}
+  LOCATION: ${{ vars.AZURE_LOCATION }}
+
+jobs:
+  validate:
+    name: Validate template
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check JSON is well-formed
+        run: python3 -m json.tool invoice-automation.json > /dev/null
+
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Ensure resource group exists
+        run: az group create -n "$RESOURCE_GROUP" -l "$LOCATION" -o none
+
+      - name: Validate deployment against Azure
+        run: |
+          az deployment group validate \
+            --resource-group "$RESOURCE_GROUP" \
+            --template-file invoice-automation.json \
+            --parameters \
+              storageAccountName=${{ vars.STORAGE_ACCOUNT_NAME }} \
+              docIntelligenceName=${{ vars.DOC_INTELLIGENCE_NAME }} \
+              sqlServerName=${{ vars.SQL_SERVER_NAME }} \
+              sqlAdminLogin=sqladmin \
+              sqlAdminPassword='${{ secrets.SQL_ADMIN_PASSWORD }}' \
+              approverEmail=${{ vars.APPROVER_EMAIL }} \
+              financeEmail=${{ vars.FINANCE_EMAIL }} \
+              deployOutlookConnection=false
+
+  deploy:
+    name: Deploy to Azure
+    needs: validate
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    environment: production   # add required reviewers in repo settings for a manual gate
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Deploy ARM template
+        run: |
+          # Redeploys must skip the Outlook connection, otherwise its OAuth token is wiped.
+          DEPLOY_OUTLOOK=${{ github.event.inputs.first_deploy == 'true' && 'true' || 'false' }}
+          az deployment group create \
+            --resource-group "$RESOURCE_GROUP" \
+            --template-file invoice-automation.json \
+            --parameters \
+              storageAccountName=${{ vars.STORAGE_ACCOUNT_NAME }} \
+              docIntelligenceName=${{ vars.DOC_INTELLIGENCE_NAME }} \
+              sqlServerName=${{ vars.SQL_SERVER_NAME }} \
+              sqlAdminLogin=sqladmin \
+              sqlAdminPassword='${{ secrets.SQL_ADMIN_PASSWORD }}' \
+              approverEmail=${{ vars.APPROVER_EMAIL }} \
+              financeEmail=${{ vars.FINANCE_EMAIL }} \
+              deployOutlookConnection=$DEPLOY_OUTLOOK
+
+      - name: Create SQL table (first deploy only)
+        if: ${{ github.event.inputs.first_deploy == 'true' }}
+        run: |
+          IP=$(curl -s https://api.ipify.org)
+          az sql server firewall-rule create -g "$RESOURCE_GROUP" -s ${{ vars.SQL_SERVER_NAME }} \
+            -n github-runner --start-ip-address $IP --end-ip-address $IP -o none
+          sudo apt-get install -y -qq mssql-tools18 unixodbc-dev >/dev/null 2>&1 || true
+          /opt/mssql-tools18/bin/sqlcmd -S ${{ vars.SQL_SERVER_NAME }}.database.windows.net \
+            -d InvoiceDb -U sqladmin -P '${{ secrets.SQL_ADMIN_PASSWORD }}' -C \
+            -i create_invoices_table.sql
+          az sql server firewall-rule delete -g "$RESOURCE_GROUP" -s ${{ vars.SQL_SERVER_NAME }} \
+            -n github-runner -y
+
+      - name: Confirm Logic App is enabled
+        run: |
+          az logic workflow show -g "$RESOURCE_GROUP" -n la-invoice-automation \
+            --query "{name:name,state:state}" -o table
