@@ -102,5 +102,6 @@ jobs:
 
       - name: Confirm Logic App is enabled
         run: |
-          az logic workflow show -g "$RESOURCE_GROUP" -n la-invoice-automation \
-            --query "{name:name,state:state}" -o table
+          az resource show -g "$RESOURCE_GROUP" -n la-invoice-automation \
+            --resource-type Microsoft.Logic/workflows \
+            --query "{name:name,state:properties.state}" -o table
